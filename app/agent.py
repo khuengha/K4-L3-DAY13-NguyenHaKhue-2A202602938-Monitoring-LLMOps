@@ -51,7 +51,7 @@ class LabAgent:
             },
         ):
             started = time.perf_counter()
-            docs = retrieve(message)
+            docs = self._retrieve(message)
             prompt = resolve_prompt(
                 langfuse_client,
                 feature=feature,
@@ -71,10 +71,7 @@ class LabAgent:
                 },
                 version=prompt.version,
             )
-            # TODO (CP2): instrument retrieve() and FakeLLM.generate() as child
-            # observations. The nested generation must receive prompt, usage and cost.
-            with propagate_attributes(prompt=prompt.managed_prompt):
-                response = self.llm.generate(prompt.text)
+            response = self._generate(prompt)
             quality_score = self._heuristic_quality(message, response.text, docs)
             latency_ms = int((time.perf_counter() - started) * 1000)
             cost_usd = self._estimate_cost(response.usage.input_tokens, response.usage.output_tokens)
@@ -97,6 +94,42 @@ class LabAgent:
             cost_usd=cost_usd,
             quality_score=quality_score,
         )
+
+    @observe(name="retrieval", as_type="retrieval", capture_input=False, capture_output=False)
+    def _retrieve(self, message: str) -> list[str]:
+        langfuse_client = get_langfuse_client()
+        docs = retrieve(message)
+        langfuse_client.update_current_span(
+            metadata={
+                "retriever": "mock-lexical",
+                "doc_count": len(docs),
+                "query_preview": summarize_text(message),
+            },
+        )
+        return docs
+
+    @observe(name="generation", as_type="generation", capture_input=False, capture_output=False)
+    def _generate(self, prompt):
+        langfuse_client = get_langfuse_client()
+        with propagate_attributes(prompt=prompt.managed_prompt):
+            response = self.llm.generate(prompt.text)
+        langfuse_client.update_current_generation(
+            model=self.model,
+            usage_details={
+                "input": response.usage.input_tokens,
+                "output": response.usage.output_tokens,
+                "total": response.usage.input_tokens + response.usage.output_tokens,
+            },
+            cost_details={
+                "input": (response.usage.input_tokens / 1_000_000) * 3,
+                "output": (response.usage.output_tokens / 1_000_000) * 15,
+                "total": self._estimate_cost(
+                    response.usage.input_tokens, response.usage.output_tokens
+                ),
+            },
+            metadata={"ttft_ms": response.ttft_ms},
+        )
+        return response
 
     def _estimate_cost(self, tokens_in: int, tokens_out: int) -> float:
         input_cost = (tokens_in / 1_000_000) * 3
